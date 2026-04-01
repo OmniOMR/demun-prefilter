@@ -1,4 +1,8 @@
 {
-  "model_variant": "b0",
-  "threshold": 0.5
+  "model_variant": "b4",
+  "threshold": 0.5,
+  "max_batch_size": 8,
+  "max_wait_ms": 3.0,
+  "use_compile": true,
+  "use_fp16": true
 }

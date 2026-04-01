@@ -14,6 +14,22 @@ pip install -r requirements.txt
 
 Model checkpoints (`model_b0.pth`, `model_b4.pth`) must be present in the working directory (or another location referenced in `config.json`). If a referenced checkpoint is missing at startup the server still boots, and the first request that points at a valid file will trigger the load.
 
+For faster JPEG decoding in `demun_local.py` (requires libjpeg-turbo 2.x):
+
+```bash
+sudo apt-get install libturbojpeg0-dev
+```
+
+`demun_local.py` automatically uses TurboJPEG when available, falling back to PIL otherwise.
+
+For full `torch.compile` support (higher throughput), install the Python development headers:
+
+```bash
+sudo apt-get install python3.12-dev   # or whichever Python version you use
+```
+
+Without them the server falls back to `torch.jit.trace`, which still provides significant optimization.
+
 ## Configuration
 
 All runtime settings live in `config.json`:
@@ -21,43 +37,70 @@ All runtime settings live in `config.json`:
 ```json
 {
   "model_variant": "b4",
-  "threshold": 0.5
+  "threshold": 0.5,
+  "max_batch_size": 8,
+  "max_wait_ms": 3.0,
+  "use_compile": true,
+  "use_fp16": true
 }
 ```
 
 - `model_variant`: `"b0"` or `"b4"` to select the EfficientNet backbone.
 - `threshold`: sigmoid cutoff used to map probabilities to `YES`/`NO`.
 - `checkpoint_path` (optional): filesystem path to the `.pth` checkpoint to load if you don't want the default `model_<variant>.pth`.
+- `max_batch_size`: maximum number of images to batch together for GPU inference. Optimal values: 32 for B0, 8 for B4.
+- `max_wait_ms`: maximum time (ms) the batcher waits to fill a batch before running inference. Lower values reduce latency; higher values improve throughput under load.
+- `use_compile`: when `true`, attempts `torch.compile` (falls back to `torch.jit.trace` if Python dev headers are missing).
+- `use_fp16`: when `true`, runs inference in half-precision for higher throughput on CUDA.
 
 The file location can be overridden by setting the `CONFIG_PATH` environment variable before launching the app.
 
-## API Endpoints
-
-- `GET /health` returns a simple status payload together with the device currently selected (`mps`, `cuda`, or `cpu`).
-- `GET /config` returns the active `model_variant`, `threshold`, and resolved `checkpoint_path`.
-- `POST /config` accepts any subset of those fields to update the runtime configuration. Leave a field out to keep the prior value or send `"checkpoint_path": null` to clear a previously set override.
-
-Example switch to the B0 model with a lower threshold:
-
-```bash
-curl -X POST http://localhost:8000/config \
-  -H "Content-Type: application/json" \
-  -d '{"model_variant": "b0", "threshold": 0.4}'
-```
-
-A checkpoint path override can be supplied in the same payload if needed.
-
-## Running the APIs
+## Running the Server
 
 ```bash
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-The device is chosen automatically in priority order `Apple MPS → CUDA → CPU`.
+On startup the server automatically:
+1. Detects the best available device (CUDA > MPS > CPU).
+2. On CUDA: enables `cudnn.benchmark` and TF32 matmul precision for tensor core utilization.
+3. Loads the configured model, applies `torch.compile` or `torch.jit.trace` + `torch.jit.freeze` with fp16 weights.
+4. Runs warmup passes to stabilize kernel selection.
+5. Starts the async batching engine with dedicated CUDA streams for transfer and compute.
 
-## Inference Contract
+## API Endpoints
 
-- **Endpoint:** `POST /predict`
+### `GET /health`
+
+Returns server status, device, and whether batching is active.
+
+```json
+{
+  "status": "ok",
+  "device": "cuda",
+  "cuda_available": true,
+  "batching_enabled": true
+}
+```
+
+### `GET /config`
+
+Returns the active runtime configuration including all performance fields.
+
+### `POST /config`
+
+Accepts any subset of config fields to update the runtime configuration. Leave a field out to keep the prior value or send `"checkpoint_path": null` to clear a previously set override. Changing the model variant, compile, or fp16 settings triggers a full model reload and batcher rebuild.
+
+```bash
+curl -X POST http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"model_variant": "b0", "threshold": 0.4, "max_batch_size": 32}'
+```
+
+### `POST /predict`
+
+Single-image prediction.
+
 - **Payload:** multipart form with an `image/*` file part named `file` and optional form fields:
   - `model_variant`: overrides the configured variant (`"b0"` or `"b4"`).
   - `threshold`: overrides the sigmoid cutoff; must parse as a float in `[0, 1]`.
@@ -74,7 +117,56 @@ The device is chosen automatically in priority order `Apple MPS → CUDA → CPU
 }
 ```
 
-`prediction` reports the thresholded decision and `probability` reports the sigmoid score ∈ [0, 1]. The response also echoes the effective `model_variant` and `threshold` that produced the decision so you can confirm any overrides.
+When the request uses the active model (no variant override), it is routed through the async batcher for optimal throughput. Requests with variant overrides fall back to a synchronous single-image path.
+
+### `POST /predict_batch`
+
+Batch prediction endpoint for maximum throughput. Send multiple images in a single HTTP request.
+
+- **Payload:** multipart form with one or more `image/*` file parts named `files`, and an optional `threshold` form field.
+- **Response:**
+
+```json
+{
+  "results": [
+    {"prediction": "YES", "probability": 0.87, "model_variant": "b4", "threshold": 0.5},
+    {"prediction": "NO", "probability": 0.12, "model_variant": "b4", "threshold": 0.5}
+  ],
+  "model_variant": "b4",
+  "threshold": 0.5
+}
+```
+
+For maximum throughput, send images pre-resized to the model's expected input size (224×224 for B0, 380×380 for B4). This skips the GPU resize step and uses a fast-path bulk transfer.
+
+## Performance
+
+Measured on NVIDIA RTX 5060 Ti (16 GB VRAM), fp16 inference, `torch.compile` (default mode), EfficientNet-B4.
+
+### Pure model throughput (no HTTP overhead)
+
+| Model | Batch Size | Throughput |
+|:------|:-----------|:-----------|
+| EfficientNet-B0 | 32 | ~5,400 img/s |
+| EfficientNet-B4 | 8 | ~700 img/s |
+
+### HTTP throughput (pre-sized images)
+
+| Model | Endpoint | Batch Size | Concurrency | Throughput |
+|:------|:---------|:-----------|:------------|:-----------|
+| EfficientNet-B4 | `POST /predict_batch` | 32 | 8 | ~419 img/s |
+
+Measured on 10,620 unique pre-resized 380×380 images (dataset repeated 3×). Without `python3-dev`, the server falls back to `torch.jit.trace` which is slightly slower.
+
+### Local mode throughput (no HTTP)
+
+`demun_local.py` bypasses HTTP entirely:
+
+| Model | Source | Throughput |
+|:------|:-------|:-----------|
+| EfficientNet-B4 | Pre-resized JPEGs from disk | ~453 img/s (steady state) |
+
+The remaining gap to the pure model ceiling (~700 img/s) is per-batch CPU/GPU pipeline overhead (numpy copies, tensor ops, sync) rather than decode. With a real C++ iipsrv the throughput approaches the same ~453 img/s as disk mode.
 
 ## Evaluation Summary
 
@@ -85,10 +177,10 @@ Performance metrics were computed on two complementary datasets:
 
 ### Balanced validation (50/50)
 
-| Model | Threshold | Throughput (img/s) | Recall | TNR |
-|:------|:----------|:-------------------|:-------|:----|
-| EfficientNet-B0 | 0.35 | ~36 | ≥ 0.98 | ~0.52 |
-| EfficientNet-B4 | 0.60 | ~20 | ~0.99 | ~0.78 |
+| Model | Threshold | Recall | TNR |
+|:------|:----------|:-------|:----|
+| EfficientNet-B0 | 0.35 | >= 0.98 | ~0.52 |
+| EfficientNet-B4 | 0.60 | ~0.99 | ~0.78 |
 
 ### Edge-case corpus (1.5% positives)
 
@@ -102,11 +194,47 @@ The edge-case dataset is intentionally adversarial: every sample was previously 
 ## Design Notes
 
 - **Objective:** Maximize recall under tight latency constraints while improving TNR on difficult negatives to reduce downstream review costs.
-- **Preprocessing:** Inputs are resized to a square resolution matching the model’s crop size (224 for B0, 380 for B4) using bicubic interpolation with antialiasing and normalized with ImageNet statistics. This data-driven variant outperformed canonical EfficientNet preprocessing on our datasets, improving recall and TNR on hard negatives.
+- **Preprocessing:** Inputs are resized to a square resolution matching the model's crop size (224 for B0, 380 for B4) using bicubic interpolation with antialiasing and normalized with ImageNet statistics. When images arrive pre-sized, the resize step is skipped entirely and a fast-path bulk transfer is used.
+- **GPU optimization:** On CUDA, the model runs in fp16 with `cudnn.benchmark` and TF32 matmul precision enabled. The model is optimized via `torch.compile(mode="default")` (if Python dev headers are available) or `torch.jit.trace` + `torch.jit.freeze` as fallback. Separate CUDA streams overlap data transfer with compute.
+- **Batching:** An async batching engine collects incoming requests into GPU batches, configured via `max_batch_size` and `max_wait_ms`. Image decoding runs in a parallel thread pool, and a pre-allocated numpy buffer enables zero-copy batch assembly for correctly-sized images.
 - **Calibration:** Thresholds are configurable per deployment through `config.json`; values above reflect empirically optimized operating points for the reported datasets.
 - **Model selection:** EfficientNet-B0 provides a rapid screening layer suitable for high-throughput scraping pipelines, while EfficientNet-B4 acts as a confirmatory stage where additional latency is acceptable in exchange for sharper discrimination. Switch between them by updating `model_variant` in the configuration.
 
-## Limitations and Future Work
+## Utility Scripts
 
-- The reported metrics derive from proprietary datasets; broader generalization depends on the similarity between deployment data and the curated corpora.
-- The service currently handles single images per request; batching and async streaming could further amplify throughput.
+### `demun_local.py` — local inference, no HTTP
+
+Runs inference directly, bypassing the HTTP server entirely. Two source modes:
+
+```bash
+# Read JPEGs from a local folder
+python demun_local.py --source folder --input /path/to/images --output results.csv
+
+# Fetch from an IIPImage server at the model's crop size
+python demun_local.py --source iipsrv \
+    --base-url http://iipsrv/fcgi-bin/iipsrv.fcgi \
+    --image-list images.txt \
+    --output results.csv
+```
+
+Options: `--variant b4|b0`, `--checkpoint path/to/model.pth`, `--batch-size 32`, `--threshold 0.5`, `--workers 8`.
+
+Uses a 2-deep decode pipeline (decode batch N+1 while GPU runs batch N) and `torch.compile` + fp16 for maximum throughput (~414 img/s with pre-resized images on the test GPU).
+
+### `resize_images.py` — pre-resize images to model input size
+
+Pre-resizes a folder of images to the model's crop size (380×380 for B4, 224×224 for B0) using BICUBIC interpolation. Pre-sized images skip the GPU resize step and enable the fast-path bulk transfer:
+
+```bash
+python resize_images.py --input /path/to/originals \
+    --output /path/to/resized \
+    --variant b4 --workers 8
+```
+
+Achieves ~600 img/s on CPU using `ProcessPoolExecutor`.
+
+## Limitations
+
+- The reported accuracy metrics derive from proprietary datasets; broader generalization depends on the similarity between deployment data and the curated corpora.
+- `torch.compile` requires Python development headers (`python3-dev`). Without them the server falls back to `torch.jit.trace` which is still performant but slightly slower.
+- The `/predict` endpoint with per-request model variant overrides bypasses the batcher and uses a slower single-image path.
