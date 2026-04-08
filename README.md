@@ -137,7 +137,7 @@ Batch prediction endpoint for maximum throughput. Send multiple images in a sing
 }
 ```
 
-For maximum throughput, send images pre-resized to the model's expected input size (224×224 for B0, 380×380 for B4). This skips the GPU resize step and uses a fast-path bulk transfer.
+Images are always resized to the model's crop size (224×224 for B0, 380×380 for B4) using GPU bicubic interpolation with antialiasing, matching the training preprocessing pipeline. **Always send images larger than the crop size** — sending an image that is already at exactly crop size skips the downscaling step and produces pixel values that differ from the training distribution, leading to incorrect predictions. A safe minimum is ~20% above crop size (e.g. 460×460 or larger for B4).
 
 ## Performance
 
@@ -164,9 +164,10 @@ Measured on 10,620 unique pre-resized 380×380 images (dataset repeated 3×). Wi
 
 | Model | Source | Throughput |
 |:------|:-------|:-----------|
-| EfficientNet-B4 | Pre-resized JPEGs from disk | ~453 img/s (steady state) |
+| EfficientNet-B0 | Pre-resized JPEGs from disk | ~2,285 img/s (steady state) |
+| EfficientNet-B4 | Pre-resized JPEGs from disk | ~570 img/s (steady state) |
 
-The remaining gap to the pure model ceiling (~700 img/s) is per-batch CPU/GPU pipeline overhead (numpy copies, tensor ops, sync) rather than decode. With a real C++ iipsrv the throughput approaches the same ~453 img/s as disk mode.
+The remaining gap to the pure model ceiling (~5,400 img/s for B0, ~700 img/s for B4) is per-batch CPU/GPU pipeline overhead (numpy copies, tensor ops, sync) rather than decode. With a real C++ iipsrv the throughput approaches the same disk-mode numbers.
 
 ## Evaluation Summary
 
@@ -194,9 +195,9 @@ The edge-case dataset is intentionally adversarial: every sample was previously 
 ## Design Notes
 
 - **Objective:** Maximize recall under tight latency constraints while improving TNR on difficult negatives to reduce downstream review costs.
-- **Preprocessing:** Inputs are resized to a square resolution matching the model's crop size (224 for B0, 380 for B4) using bicubic interpolation with antialiasing and normalized with ImageNet statistics. When images arrive pre-sized, the resize step is skipped entirely and a fast-path bulk transfer is used.
+- **Preprocessing:** Inputs are always resized to the model's crop size (224 for B0, 380 for B4) using GPU bicubic interpolation with antialiasing and normalized with ImageNet statistics. Images must be larger than the crop size — sending an already-cropped image bypasses the downscaling and produces pixel statistics that differ from the training distribution.
 - **GPU optimization:** On CUDA, the model runs in fp16 with `cudnn.benchmark` and TF32 matmul precision enabled. The model is optimized via `torch.compile(mode="default")` (if Python dev headers are available) or `torch.jit.trace` + `torch.jit.freeze` as fallback. Separate CUDA streams overlap data transfer with compute.
-- **Batching:** An async batching engine collects incoming requests into GPU batches, configured via `max_batch_size` and `max_wait_ms`. Image decoding runs in a parallel thread pool, and a pre-allocated numpy buffer enables zero-copy batch assembly for correctly-sized images.
+- **Batching:** An async batching engine collects incoming requests into GPU batches, configured via `max_batch_size` and `max_wait_ms`. Image decoding runs in a parallel thread pool.
 - **Calibration:** Thresholds are configurable per deployment through `config.json`; values above reflect empirically optimized operating points for the reported datasets.
 - **Model selection:** EfficientNet-B0 provides a rapid screening layer suitable for high-throughput scraping pipelines, while EfficientNet-B4 acts as a confirmatory stage where additional latency is acceptable in exchange for sharper discrimination. Switch between them by updating `model_variant` in the configuration.
 
@@ -223,7 +224,7 @@ Uses a 2-deep decode pipeline (decode batch N+1 while GPU runs batch N) and `tor
 
 ### `resize_images.py` — pre-resize images to model input size
 
-Pre-resizes a folder of images to the model's crop size (380×380 for B4, 224×224 for B0) using BICUBIC interpolation. Pre-sized images skip the GPU resize step and enable the fast-path bulk transfer:
+Pre-resizes a folder of images to the model's crop size (380×380 for B4, 224×224 for B0) using BICUBIC interpolation:
 
 ```bash
 python resize_images.py --input /path/to/originals \

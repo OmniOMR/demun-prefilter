@@ -298,17 +298,6 @@ def _decode_image_to_numpy(raw: bytes) -> np.ndarray:
         raise InvalidImageError(f"Cannot decode image: {exc}") from exc
 
 
-def _decode_into_buffer(args: Tuple) -> Tuple[int, bool]:
-    """Decode image and write into pre-allocated buffer. Returns (index, success)."""
-    idx, raw, buf, crop_size = args
-    arr = _decode_image_to_numpy(raw)
-    h, w = arr.shape[:2]
-    if h == crop_size and w == crop_size:
-        buf[idx] = arr
-        return idx, True
-    return idx, False
-
-
 def preprocess_batch_gpu(
     images_bytes: List[bytes],
     crop_size: int,
@@ -318,55 +307,28 @@ def preprocess_batch_gpu(
     np_buffer: Optional[np.ndarray] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """Decode images on CPU, then normalize (and optionally resize) on GPU.
+    """Decode images on CPU, then resize+normalize on GPU.
 
-    Uses bicubic direct square resize to crop_size×crop_size — empirically
-    validated as best.
-
-    Fast path: when all images are already crop_size x crop_size, decodes into
-    a pre-allocated numpy buffer and does a single bulk transfer to GPU.
-    Slow path: per-image GPU resize for images that need it.
+    Always applies bicubic+antialias resize to crop_size×crop_size to match
+    the training preprocessing pipeline, regardless of input dimensions.
     """
-    batch_size = len(images_bytes)
-
-    # Try fast path: parallel decode into pre-allocated buffer
-    if np_buffer is not None and len(np_buffer) >= batch_size:
-        buf = np_buffer[:batch_size]
-        decode_args = [(i, raw, buf, crop_size) for i, raw in enumerate(images_bytes)]
-        results = list(_DECODE_POOL.map(_decode_into_buffer, decode_args))
-        all_correct_size = all(ok for _, ok in results)
-    else:
-        all_correct_size = False
-
-    ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
-
-    if all_correct_size:
-        # Fast path: single bulk transfer, no resize
-        with ctx:
-            # buf is [B, crop, crop, 3] uint8 → permute to [B, 3, crop, crop]
-            batch = torch.from_numpy(buf).permute(0, 3, 1, 2).to(DEVICE, non_blocking=True)
-            batch = batch.to(dtype) / 255.0
-            batch = (batch - mean_t) / std_t
-        return batch
-
-    # Slow path: decode individually, resize+crop on GPU to match training pipeline
     futures = [_DECODE_POOL.submit(_decode_image_to_numpy, raw) for raw in images_bytes]
     decoded = [f.result() for f in futures]
+
+    ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
 
     with ctx:
         batch_tensors = []
         for arr in decoded:
-            h, w = arr.shape[:2]
             t_cpu = torch.from_numpy(arr).permute(2, 0, 1)  # [3,H,W]
-            t_gpu = t_cpu.to(DEVICE, non_blocking=True).unsqueeze(0)  # [1,3,H,W]
-            if h != crop_size or w != crop_size:
-                t_gpu = F.interpolate(
-                    t_gpu.float(), size=(crop_size, crop_size),
-                    mode="bicubic", align_corners=False, antialias=True,
-                )
+            t_gpu = t_cpu.to(DEVICE, non_blocking=True).unsqueeze(0).float()  # [1,3,H,W]
+            t_gpu = F.interpolate(
+                t_gpu, size=(crop_size, crop_size),
+                mode="bicubic", align_corners=False, antialias=True,
+            )
             batch_tensors.append(t_gpu)
 
-        stacked = torch.cat(batch_tensors, dim=0)  # already on GPU
+        stacked = torch.cat(batch_tensors, dim=0)  # [B,3,H,W] on GPU
         batch = stacked.to(dtype) / 255.0
         batch = (batch - mean_t) / std_t
 
